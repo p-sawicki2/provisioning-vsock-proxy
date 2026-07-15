@@ -39,10 +39,10 @@ pub fn copy_bidirectional(
 
     let tcp_reader = tcp
         .try_clone()
-        .map_err(|e| io::Error::new(e.kind(), "Failed to clone TCP stream"))?;
+        .map_err(|e| io::Error::new(e.kind(), "Failed to clone TCP reader stream"))?;
     let vsock_writer = vsock
         .try_clone()
-        .map_err(|e| io::Error::new(e.kind(), "Failed to clone VSOCK stream"))?;
+        .map_err(|e| io::Error::new(e.kind(), "Failed to clone VSOCK writer stream"))?;
     let bytes_rx_clone = Arc::clone(&bytes_rx);
 
     // Handling VSOCK <- TCP stream
@@ -78,8 +78,12 @@ pub fn copy_bidirectional(
     });
 
     // Handling VSOCK -> TCP stream
-    let vsock_reader = vsock.try_clone().expect("Failed to clone vsock");
-    let tcp_writer = tcp.try_clone().expect("Failed to clone TCP stream");
+    let vsock_reader = vsock
+        .try_clone()
+        .map_err(|e| io::Error::new(e.kind(), "Failed to clone VSOCK reader stream"))?;
+    let tcp_writer = tcp
+        .try_clone()
+        .map_err(|e| io::Error::new(e.kind(), "Failed to clone TCP writer stream"))?;
     let bytes_tx_clone = Arc::clone(&bytes_tx);
 
     let vsock_read_handle = thread::spawn(move || -> io::Result<()> {

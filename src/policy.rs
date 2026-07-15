@@ -2,7 +2,7 @@ use log::debug;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::RwLock;
 
 /// Rule defining access policy for a specific server
@@ -126,10 +126,17 @@ impl PolicyManager
             return true;
         }
 
-        // Try to parse both as IP addresses and compare
+        // Try to parse both as IPv4/IPv6 addresses and compare
         if let (Ok(rule_ip), Ok(check_ip)) = (
             rule_addr.parse::<Ipv4Addr>(),
             check_addr.parse::<Ipv4Addr>(),
+        ) {
+            return rule_ip == check_ip;
+        }
+
+        if let (Ok(rule_ip), Ok(check_ip)) = (
+            rule_addr.parse::<Ipv6Addr>(),
+            check_addr.parse::<Ipv6Addr>()
         ) {
             return rule_ip == check_ip;
         }
