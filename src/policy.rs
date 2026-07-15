@@ -122,7 +122,7 @@ impl PolicyManager
     fn addresses_match(&self, rule_addr: &str, check_addr: &str) -> bool
     {
         // First try exact string match (for domain names or when both are the same format)
-        if rule_addr == check_addr {
+        if rule_addr.to_lowercase() == check_addr.to_lowercase() {
             return true;
         }
 
