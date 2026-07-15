@@ -58,8 +58,8 @@ impl fmt::Display for VsockCid
 /// Default proxy port
 const DEFAULT_PORT: u32 = 1337;
 
-/// Default buffer size
-const BUFFER_SIZE: usize = 8192;
+/// Default buffer size (64 KB)
+const BUFFER_SIZE: usize = 65536;
 
 /// Default TCP connection timeout in seconds
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -248,11 +248,6 @@ fn handle_vsock_connection(
             return Err(e);
         }
     };
-
-    tcp.set_read_timeout(Some(Duration::from_secs(timeout_secs)))
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to set TCP read timeout: {}", e)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(timeout_secs)))
-        .map_err(|e| io::Error::new(e.kind(), format!("Failed to set TCP write timeout: {}", e)))?;
 
     if tx_limit.is_some() {
         info!(

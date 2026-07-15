@@ -8,105 +8,21 @@ use vsock::VsockStream;
 
 use crate::BUFFER_SIZE;
 
-trait TxLimitChecker
-{
-    fn check(&self, current_tx: u64) -> io::Result<()>;
-}
+const BUFFER_SIZE_VSOCK: usize = BUFFER_SIZE;
 
-/// Checker that uses a hard limit for transmitted bytes
-struct WithLimit
+/// Checks if the transmitted bytes exceed the limit
+fn check_tx_limit(current_tx: u64, limit: Option<u64>) -> io::Result<()>
 {
-    limit: u64,
-}
-
-impl TxLimitChecker for WithLimit
-{
-    fn check(&self, current_tx: u64) -> io::Result<()>
-    {
-        if current_tx > self.limit {
-            warn!("TX bytes limit exceeded: {} > {}", current_tx, self.limit);
+    if let Some(max) = limit {
+        if current_tx > max {
+            warn!("TX bytes limit exceeded: {} > {}", current_tx, max);
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("TX bytes limit exceeded: {} > {}", current_tx, self.limit),
+                format!("TX bytes limit exceeded: {} > {}", current_tx, max),
             ));
         }
-        Ok(())
     }
-}
-
-/// Checker that always succeeds
-struct NoLimit;
-
-impl TxLimitChecker for NoLimit
-{
-    fn check(&self, _current_tx: u64) -> io::Result<()>
-    {
-        Ok(())
-    }
-}
-
-fn copy_vsock_to_tcp(
-    vsock_reader: VsockStream,
-    tcp_writer: TcpStream,
-    bytes_tx_clone: Arc<AtomicU64>,
-    tx_bytes_limit: Option<u64>,
-) -> thread::JoinHandle<io::Result<()>>
-{
-
-    fn copy_loop<C: TxLimitChecker + Send + 'static>(
-        vsock_reader: VsockStream,
-        tcp_writer: TcpStream,
-        bytes_tx_clone: Arc<AtomicU64>,
-        checker: C,
-    ) -> thread::JoinHandle<io::Result<()>>
-    {
-        thread::spawn(move || -> io::Result<()> {
-            let mut vsock_read = vsock_reader;
-            let mut tcp_write = tcp_writer;
-            let mut vsock_buf = [0u8; 8192];
-
-            let result = (|| -> io::Result<()> {
-                loop {
-                    match vsock_read.read(&mut vsock_buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let current_tx =
-                                bytes_tx_clone.fetch_add(n as u64, Ordering::SeqCst) + n as u64;
-
-                            checker.check(current_tx)?;
-
-                            tcp_write.write_all(&vsock_buf[..n])?;
-                            tcp_write.flush()?;
-                            debug!("VSOCK -> TCP TX: {} bytes", n);
-                        }
-                        Err(e) => {
-                            debug!("VSOCK -> TCP TX Error: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-                Ok(())
-            })();
-            debug!("VSOCK -> TCP TX done");
-            if let Err(e) = vsock_read.shutdown(Shutdown::Read) {
-                debug!("Vsock read shutdown (expected on peer close): {}", e);
-            }
-            if let Err(e) = tcp_write.shutdown(Shutdown::Write) {
-                debug!("TCP write shutdown (expected on peer close): {}", e);
-            }
-            result
-        })
-    }
-
-    match tx_bytes_limit {
-        Some(limit) => copy_loop(
-            vsock_reader,
-            tcp_writer,
-            bytes_tx_clone,
-            WithLimit { limit },
-        ),
-        None => copy_loop(vsock_reader, tcp_writer, bytes_tx_clone, NoLimit),
-    }
+    Ok(())
 }
 
 /// Copies data bidirectionally between vsock and TCP streams
@@ -121,8 +37,12 @@ pub fn copy_bidirectional(
     let bytes_tx = Arc::new(AtomicU64::new(0));
     let bytes_rx = Arc::new(AtomicU64::new(0));
 
-    let tcp_reader = tcp.try_clone().expect("Failed to clone TCP stream");
-    let vsock_writer = vsock.try_clone().expect("Failed to clone vsock");
+    let tcp_reader = tcp.try_clone().map_err(|e|
+        io::Error::new(e.kind(), "Failed to clone TCP stream")
+    )?;
+    let vsock_writer = vsock.try_clone().map_err(|e|
+        io::Error::new(e.kind(), "Failed to clone VSOCK stream")
+    )?;
     let bytes_rx_clone = Arc::clone(&bytes_rx);
 
     // Handling VSOCK <- TCP stream
@@ -157,14 +77,49 @@ pub fn copy_bidirectional(
         result
     });
 
+    // Handling VSOCK -> TCP stream
     let vsock_reader = vsock.try_clone().expect("Failed to clone vsock");
     let tcp_writer = tcp.try_clone().expect("Failed to clone TCP stream");
     let bytes_tx_clone = Arc::clone(&bytes_tx);
 
-    // Handling VSOCK -> TCP stream
-    let vsock_read_result =
-        copy_vsock_to_tcp(vsock_reader, tcp_writer, bytes_tx_clone, tx_bytes_limit);
+    let vsock_read_handle = thread::spawn(move || -> io::Result<()> {
+        let mut vsock_read = vsock_reader;
+        let mut tcp_write = tcp_writer;
+        let mut vsock_buf = [0u8; BUFFER_SIZE_VSOCK];
 
+        let result = (|| -> io::Result<()> {
+            loop {
+                match vsock_read.read(&mut vsock_buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let current_tx =
+                            bytes_tx_clone.fetch_add(n as u64, Ordering::SeqCst) + n as u64;
+
+                        check_tx_limit(current_tx, tx_bytes_limit)?;
+
+                        tcp_write.write_all(&vsock_buf[..n])?;
+                        tcp_write.flush()?;
+                        debug!("VSOCK -> TCP TX: {} bytes", n);
+                    }
+                    Err(e) => {
+                        debug!("VSOCK -> TCP TX Error: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        debug!("VSOCK -> TCP TX done");
+        if let Err(e) = vsock_read.shutdown(Shutdown::Read) {
+            debug!("Vsock read shutdown (expected on peer close): {}", e);
+        }
+        if let Err(e) = tcp_write.shutdown(Shutdown::Write) {
+            debug!("TCP write shutdown (expected on peer close): {}", e);
+        }
+        result
+    });
+
+    // Wait for both threads and handle errors
     match vsock_write_handle.join() {
         Ok(thread_result) => {
             if let Err(e) = thread_result {
@@ -176,7 +131,7 @@ pub fn copy_bidirectional(
         Err(_) => debug!("VSOCK <- TCP thread panicked"),
     }
 
-    match vsock_read_result.join() {
+    match vsock_read_handle.join() {
         Ok(thread_result) => {
             if let Err(e) = thread_result {
                 if !is_expected_close_error(&e) {
