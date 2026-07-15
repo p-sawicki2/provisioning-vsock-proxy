@@ -2,10 +2,10 @@ pub mod policy;
 pub mod stream_helpers;
 
 use clap::{Parser, ValueEnum};
-use log::{error, info};
+use log::{debug, error, info};
 use std::fmt;
 use std::io::{self};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -217,8 +217,8 @@ fn handle_vsock_connection(
         None
     };
 
-    // Resolve the address (handles both IP addresses and domain names via DNS)
-    let addr: SocketAddr = tcp_addr
+    // Resolve the address and try to connect to each resolved address (fallback support)
+    let (tcp, connected_addr) = tcp_addr
         .to_socket_addrs()
         .map_err(|e| {
             error!("Failed to resolve server address '{}': {}", tcp_addr, e);
@@ -227,39 +227,31 @@ fn handle_vsock_connection(
                 format!("Failed to resolve address: {}", e),
             )
         })?
-        .next()
+        .find_map(|addr| {
+            debug!("Attempting TCP connection to {}", addr);
+            TcpStream::connect_timeout(&addr, Duration::from_secs(timeout_secs))
+                .map_err(|e| {
+                    error!("Failed to connect to {}: {}", addr, e);
+                    e
+                })
+                .ok()
+                .map(|tcp| (tcp, addr))
+        })
         .ok_or_else(|| {
-            error!("No addresses resolved for '{}'", tcp_addr);
-            io::Error::new(io::ErrorKind::InvalidInput, "No addresses resolved")
+            error!(
+                "Failed to connect to any resolved address for '{}'",
+                tcp_addr
+            );
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "Failed to connect to any resolved address",
+            )
         })?;
 
     info!(
-        "Resolved '{}' to {}, establishing TCP connection",
-        tcp_addr, addr
+        "TCP connection established to {} (resolved from '{}'), starting proxy",
+        connected_addr, tcp_addr
     );
-
-    let tcp = match TcpStream::connect_timeout(&addr, Duration::from_secs(timeout_secs)) {
-        Ok(tcp) => tcp,
-        Err(e) => {
-            error!(
-                "Failed to connect to {} within {}s: {}",
-                tcp_addr, timeout_secs, e
-            );
-            return Err(e);
-        }
-    };
-
-    if tx_limit.is_some() {
-        info!(
-            "TCP connection established with {}s timeout, TX limit: {:?}, starting proxy",
-            timeout_secs, tx_limit
-        );
-    } else {
-        info!(
-            "TCP connection established with {}s timeout, starting proxy",
-            timeout_secs
-        );
-    }
 
     if let Err(e) = stream_helpers::copy_bidirectional(vsock, tcp, tx_limit) {
         error!("Copy bidirectional error: {}", e);

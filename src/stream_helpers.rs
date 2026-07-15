@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
@@ -37,12 +37,12 @@ pub fn copy_bidirectional(
     let bytes_tx = Arc::new(AtomicU64::new(0));
     let bytes_rx = Arc::new(AtomicU64::new(0));
 
-    let tcp_reader = tcp.try_clone().map_err(|e|
-        io::Error::new(e.kind(), "Failed to clone TCP stream")
-    )?;
-    let vsock_writer = vsock.try_clone().map_err(|e|
-        io::Error::new(e.kind(), "Failed to clone VSOCK stream")
-    )?;
+    let tcp_reader = tcp
+        .try_clone()
+        .map_err(|e| io::Error::new(e.kind(), "Failed to clone TCP stream"))?;
+    let vsock_writer = vsock
+        .try_clone()
+        .map_err(|e| io::Error::new(e.kind(), "Failed to clone VSOCK stream"))?;
     let bytes_rx_clone = Arc::clone(&bytes_rx);
 
     // Handling VSOCK <- TCP stream
@@ -142,7 +142,7 @@ pub fn copy_bidirectional(
         Err(_) => debug!("VSOCK -> TCP thread panicked"),
     }
 
-    debug!(
+    info!(
         "Connection complete: TX: {} bytes, RX: {} bytes total",
         bytes_tx.load(Ordering::SeqCst),
         bytes_rx.load(Ordering::SeqCst)
