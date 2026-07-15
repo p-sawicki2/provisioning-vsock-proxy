@@ -63,6 +63,9 @@ const BUFFER_SIZE: usize = 65536;
 /// Default TCP connection timeout in seconds
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// The timeout for read/write operations on TCP socket
+const TCP_READ_WRITE_TIMEOUT: u64 = 60;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args
@@ -241,6 +244,11 @@ fn handle_vsock_connection(
                 "Failed to connect to any resolved address",
             )
         })?;
+
+    tcp.set_read_timeout(Some(Duration::from_secs(TCP_READ_WRITE_TIMEOUT)))
+        .map_err(|e| io::Error::new(e.kind(), format!("Failed to set TCP read timeout: {}", e)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(TCP_READ_WRITE_TIMEOUT)))
+        .map_err(|e| io::Error::new(e.kind(), format!("Failed to set TCP write timeout: {}", e)))?;
 
     info!(
         "TCP connection established to {} (resolved from '{}'), starting proxy",
