@@ -7,7 +7,6 @@ use std::fmt;
 use std::io::{self};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use vsock::{VMADDR_CID_HOST, VMADDR_CID_LOCAL, VsockListener, VsockStream};
 
@@ -146,20 +145,15 @@ fn main() -> io::Result<()>
                     peer_addr.port()
                 );
 
-                let server_addr = args.server_addr.clone();
-                let timeout_secs = args.timeout_secs;
-                let policy_manager = policy_manager.clone();
+                if let Err(e) = handle_vsock_connection(
+                    vsock,
+                    &args.server_addr,
+                    args.timeout_secs,
+                    policy_manager.as_deref(),
+                ) {
+                    error!("Connection handler error: {}", e);
+                }
 
-                thread::spawn(move || {
-                    if let Err(e) = handle_vsock_connection(
-                        vsock,
-                        &server_addr,
-                        timeout_secs,
-                        policy_manager.as_deref(),
-                    ) {
-                        error!("Connection handler error: {}", e);
-                    }
-                });
             }
             Err(e) => {
                 error!("Failed to accept vsock connection: {}", e);
