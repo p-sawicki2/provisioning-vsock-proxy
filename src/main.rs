@@ -8,7 +8,7 @@ use std::io::{self};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
-use vsock::{VMADDR_CID_HOST, VMADDR_CID_LOCAL, VsockListener, VsockStream};
+use vsock::{VsockListener, VsockStream, VMADDR_CID_HOST, VMADDR_CID_LOCAL};
 
 /// Vsock Context ID options for binding
 ///
@@ -158,7 +158,6 @@ fn main() -> io::Result<()>
                 ) {
                     error!("Connection handler error: {}", e);
                 }
-
             }
             Err(e) => {
                 error!("Failed to accept vsock connection: {}", e);

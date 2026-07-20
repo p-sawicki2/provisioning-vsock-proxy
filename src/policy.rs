@@ -3,8 +3,22 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+
+/// Converts IPv6-mapped IPv4 addresses (e.g., ::ffff:192.168.1.1) to IPv4 format
+/// Returns the original string if conversion is not possible
+fn normalize_address(address: String) -> String
+{
+    // Try to parse as IPv6 and check if it's a mapped IPv4 address
+    if let Ok(ipv6) = address.parse::<Ipv6Addr>() {
+        if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+            return ipv4.to_string();
+        }
+    }
+    // Return original if not an IPv6-mapped IPv4 address
+    address
+}
 
 /// Rule defining access policy for a specific server
 /// This struct contains only configuration data from the JSON policy file
@@ -31,16 +45,20 @@ pub struct ServerStatsHashMap
     stats: HashMap<ServerKey, Arc<AtomicU64>>,
 }
 
-impl ServerStatsHashMap {
-    pub fn new() -> Self {
+impl ServerStatsHashMap
+{
+    pub fn new() -> Self
+    {
         ServerStatsHashMap {
             stats: HashMap::new(),
         }
     }
 
     /// Gets or creates a counter for the given server
-    pub fn get_or_create_counter(&mut self, address: &str, port: u16) -> Arc<AtomicU64> {
-        let key = (address.to_lowercase(), port);
+    pub fn get_or_create_counter(&mut self, address: &str, port: u16) -> Arc<AtomicU64>
+    {
+        let normalized = normalize_address(address.to_string());
+        let key = (normalized.to_lowercase(), port);
         self.stats
             .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -48,13 +66,15 @@ impl ServerStatsHashMap {
     }
 }
 
-impl Default for ServerStatsHashMap {
-    fn default() -> Self {
+impl Default for ServerStatsHashMap
+{
+    fn default() -> Self
+    {
         Self::new()
     }
 }
 
-/// A policy manager maintaining the whitelist of servers and runtime statistics
+/// A policy manager maintaining the whitelist of servers and TCP/IP connections statistics
 pub struct PolicyManager
 {
     whitelist: RwLock<ServerWhitelist>,
@@ -132,14 +152,22 @@ impl PolicyManager
     /// Creates a counter if one doesn't exist yet
     pub fn tx_bytes_used(&self, address: &str, port: u16) -> u64
     {
-        let mut stats_guard = self.stats.write().expect("Failed to acquire stats write lock");
+        let mut stats_guard = self
+            .stats
+            .write()
+            .expect("Failed to acquire stats write lock");
         let counter = stats_guard.get_or_create_counter(address, port);
         counter.load(Ordering::SeqCst)
     }
 
     /// Checks if adding the specified bytes would exceed the limit for the server,
     /// and if not, atomically adds the bytes to the counter.
-    pub fn check_and_add_tx_bytes(&self, address: &str, port: u16, bytes_to_add: u64) -> Result<(), std::io::Error>
+    pub fn check_and_add_tx_bytes(
+        &self,
+        address: &str,
+        port: u16,
+        bytes_to_add: u64,
+    ) -> Result<(), std::io::Error>
     {
         // First check if the server is in the whitelist and get its limit
         let whitelist_guard = self.whitelist.read().expect("Failed to acquire read lock");
@@ -157,7 +185,10 @@ impl PolicyManager
         drop(whitelist_guard);
 
         // Get or create the counter in stats map
-        let mut stats_guard = self.stats.write().expect("Failed to acquire stats write lock");
+        let mut stats_guard = self
+            .stats
+            .write()
+            .expect("Failed to acquire stats write lock");
         let counter = stats_guard.get_or_create_counter(address, port);
 
         // Check and add atomically using compare-exchange loop
@@ -176,7 +207,12 @@ impl PolicyManager
             }
 
             // Try to atomically add the bytes
-            match counter.compare_exchange(current, current + bytes_to_add, Ordering::SeqCst, Ordering::SeqCst) {
+            match counter.compare_exchange(
+                current,
+                current + bytes_to_add,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
                 Ok(_) => return Ok(()),
                 Err(_new_current) => {
                     // Another thread modified the counter, retry with new value
@@ -186,26 +222,29 @@ impl PolicyManager
         }
     }
 
-
     /// Compares two addresses, handling both domain names and IP addresses
     fn addresses_match(&self, rule_addr: &str, check_addr: &str) -> bool
     {
+        // Normalize both addresses to handle IPv6-mapped IPv4 addresses
+        let rule_addr_normalized = normalize_address(rule_addr.to_string());
+        let check_addr_normalized = normalize_address(check_addr.to_string());
+
         // First try exact string match (for domain names or when both are the same format)
-        if rule_addr.to_lowercase() == check_addr.to_lowercase() {
+        if rule_addr_normalized.to_lowercase() == check_addr_normalized.to_lowercase() {
             return true;
         }
 
         // Try to parse both as IPv4/IPv6 addresses and compare
         if let (Ok(rule_ip), Ok(check_ip)) = (
-            rule_addr.parse::<Ipv4Addr>(),
-            check_addr.parse::<Ipv4Addr>(),
+            rule_addr_normalized.parse::<Ipv4Addr>(),
+            check_addr_normalized.parse::<Ipv4Addr>(),
         ) {
             return rule_ip == check_ip;
         }
 
         if let (Ok(rule_ip), Ok(check_ip)) = (
-            rule_addr.parse::<Ipv6Addr>(),
-            check_addr.parse::<Ipv6Addr>()
+            rule_addr_normalized.parse::<Ipv6Addr>(),
+            check_addr_normalized.parse::<Ipv6Addr>(),
         ) {
             return rule_ip == check_ip;
         }
@@ -226,19 +265,16 @@ impl PolicyManager
     }
 
     /// Logs connection completion with cumulative TX bytes used for the server
-    pub fn log_connection_complete(&self, address: &str, port: u16, bytes_rx: u64)
+    pub fn log_connection_complete(&self, address: &str, port: u16)
     {
-        let used = self.tx_bytes_used(address, port);
         if let Some(limit) = self.tx_bytes_limit(address, port) {
+            let used = self.tx_bytes_used(address, port);
             info!(
-                "Connection complete: Server {}:{} used {} / {} bytes (cumulative)",
-                address, port, used, limit
+                "  TX: used {} / {} bytes (cumulative) Server {}:{}",
+                used, limit, address, port,
             );
-        } else {
-            info!("Connection complete: RX: {} bytes", bytes_rx);
         }
     }
-
 }
 
 #[cfg(test)]
@@ -365,7 +401,9 @@ mod tests
         assert_eq!(manager.tx_bytes_used("example.com", 443), 0);
 
         // After first transmission, counter is updated
-        assert!(manager.check_and_add_tx_bytes("example.com", 443, 100).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("example.com", 443, 100)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("example.com", 443), 100);
 
         fs::remove_file(test_file).ok();
@@ -387,24 +425,34 @@ mod tests
         manager.load_from_file(test_file).unwrap();
 
         // First addition should succeed
-        assert!(manager.check_and_add_tx_bytes("example.com", 443, 100).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("example.com", 443, 100)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("example.com", 443), 100);
 
         // Second addition should succeed
-        assert!(manager.check_and_add_tx_bytes("example.com", 443, 200).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("example.com", 443, 200)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("example.com", 443), 300);
 
         // Third addition that would exceed limit should fail
-        assert!(manager.check_and_add_tx_bytes("example.com", 443, 800).is_err());
+        assert!(manager
+            .check_and_add_tx_bytes("example.com", 443, 800)
+            .is_err());
         // Counter should remain unchanged after failed addition
         assert_eq!(manager.tx_bytes_used("example.com", 443), 300);
 
         // Addition that brings exactly to limit should succeed
-        assert!(manager.check_and_add_tx_bytes("example.com", 443, 700).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("example.com", 443, 700)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("example.com", 443), 1000);
 
         // Any further addition should fail
-        assert!(manager.check_and_add_tx_bytes("example.com", 443, 1).is_err());
+        assert!(manager
+            .check_and_add_tx_bytes("example.com", 443, 1)
+            .is_err());
 
         fs::remove_file(test_file).ok();
     }
@@ -427,12 +475,18 @@ mod tests
         // Adding bytes to unknown server should fail
         let result = manager.check_and_add_tx_bytes("unknown.com", 443, 100);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
 
         // Adding bytes to known server but unknown port should fail
         let result = manager.check_and_add_tx_bytes("example.com", 80, 100);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
 
         fs::remove_file(test_file).ok();
     }
@@ -454,7 +508,9 @@ mod tests
 
         // Simulate multiple sessions adding bytes
         for i in 1..=10 {
-            assert!(manager.check_and_add_tx_bytes("example.com", 443, 100).is_ok());
+            assert!(manager
+                .check_and_add_tx_bytes("example.com", 443, 100)
+                .is_ok());
             assert_eq!(manager.tx_bytes_used("example.com", 443), i * 100);
         }
 
@@ -482,25 +538,178 @@ mod tests
         assert_eq!(manager.tx_bytes_used("server2.com", 443), 0);
 
         // Add bytes to server1
-        assert!(manager.check_and_add_tx_bytes("server1.com", 443, 500).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("server1.com", 443, 500)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("server1.com", 443), 500);
         assert_eq!(manager.tx_bytes_used("server2.com", 443), 0);
 
         // Add bytes to server2
-        assert!(manager.check_and_add_tx_bytes("server2.com", 443, 1500).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("server2.com", 443, 1500)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("server1.com", 443), 500);
         assert_eq!(manager.tx_bytes_used("server2.com", 443), 1500);
 
         // server1 should still have room for 500 more
-        assert!(manager.check_and_add_tx_bytes("server1.com", 443, 500).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("server1.com", 443, 500)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("server1.com", 443), 1000);
 
         // server1 is now at limit
-        assert!(manager.check_and_add_tx_bytes("server1.com", 443, 1).is_err());
+        assert!(manager
+            .check_and_add_tx_bytes("server1.com", 443, 1)
+            .is_err());
 
         // server2 should still have room for 500 more
-        assert!(manager.check_and_add_tx_bytes("server2.com", 443, 500).is_ok());
+        assert!(manager
+            .check_and_add_tx_bytes("server2.com", 443, 500)
+            .is_ok());
         assert_eq!(manager.tx_bytes_used("server2.com", 443), 2000);
+
+        fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_normalize_address_ipv4_mapped()
+    {
+        // Test IPv6-mapped IPv4 address conversion
+        assert_eq!(
+            normalize_address("::ffff:192.168.1.1".to_string()),
+            "192.168.1.1"
+        );
+        assert_eq!(normalize_address("::ffff:10.0.0.1".to_string()), "10.0.0.1");
+        assert_eq!(
+            normalize_address("::ffff:127.0.0.1".to_string()),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_normalize_address_regular_ipv4()
+    {
+        // Regular IPv4 addresses should be returned unchanged
+        assert_eq!(normalize_address("192.168.1.1".to_string()), "192.168.1.1");
+        assert_eq!(normalize_address("10.0.0.1".to_string()), "10.0.0.1");
+        assert_eq!(normalize_address("127.0.0.1".to_string()), "127.0.0.1");
+    }
+
+    #[test]
+    fn test_normalize_address_regular_ipv6()
+    {
+        // Regular IPv6 addresses should be returned unchanged
+        assert_eq!(normalize_address("::1".to_string()), "::1");
+        assert_eq!(normalize_address("2001:db8::1".to_string()), "2001:db8::1");
+        assert_eq!(normalize_address("fe80::1".to_string()), "fe80::1");
+    }
+
+    #[test]
+    fn test_normalize_address_domain_name()
+    {
+        // Domain names should be returned unchanged
+        assert_eq!(normalize_address("example.com".to_string()), "example.com");
+        assert_eq!(normalize_address("localhost".to_string()), "localhost");
+        assert_eq!(
+            normalize_address("api.example.org".to_string()),
+            "api.example.org"
+        );
+    }
+
+    #[test]
+    fn test_normalize_address_invalid()
+    {
+        // Invalid addresses should be returned unchanged
+        assert_eq!(normalize_address("invalid".to_string()), "invalid");
+        assert_eq!(normalize_address("".to_string()), "");
+    }
+
+    #[test]
+    fn test_addresses_match_ipv4()
+    {
+        let manager = PolicyManager::new();
+
+        let test_content = r#"[
+            {"address": "192.168.1.1", "port": 443, "tx_bytes_limit": 1024}
+        ]"#;
+
+        let test_file = "/tmp/test_policy_addr_match.json";
+        let mut file = File::create(test_file).unwrap();
+        file.write_all(test_content.as_bytes()).unwrap();
+
+        manager.load_from_file(test_file).unwrap();
+
+        // IPv4 should match same IPv4
+        assert!(manager.is_allowed("192.168.1.1", 443));
+        // Different IPv4 should not match
+        assert!(!manager.is_allowed("192.168.1.2", 443));
+
+        fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_addresses_match_ipv6_mapped_ipv4()
+    {
+        let manager = PolicyManager::new();
+
+        let test_content = r#"[
+            {"address": "192.168.1.1", "port": 443, "tx_bytes_limit": 1024}
+        ]"#;
+
+        let test_file = "/tmp/test_policy_ipv6_mapped.json";
+        let mut file = File::create(test_file).unwrap();
+        file.write_all(test_content.as_bytes()).unwrap();
+
+        manager.load_from_file(test_file).unwrap();
+
+        // IPv6-mapped IPv4 should match the IPv4 rule
+        assert!(manager.is_allowed("::ffff:192.168.1.1", 443));
+
+        fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_addresses_match_domain_case_insensitive()
+    {
+        let manager = PolicyManager::new();
+
+        let test_content = r#"[
+            {"address": "Example.com", "port": 443, "tx_bytes_limit": 1024}
+        ]"#;
+
+        let test_file = "/tmp/test_policy_case.json";
+        let mut file = File::create(test_file).unwrap();
+        file.write_all(test_content.as_bytes()).unwrap();
+
+        manager.load_from_file(test_file).unwrap();
+
+        // Domain matching should be case-insensitive
+        assert!(manager.is_allowed("example.com", 443));
+        assert!(manager.is_allowed("EXAMPLE.COM", 443));
+        assert!(manager.is_allowed("Example.COM", 443));
+
+        fs::remove_file(test_file).ok();
+    }
+
+    #[test]
+    fn test_addresses_match_ipv6()
+    {
+        let manager = PolicyManager::new();
+
+        let test_content = r#"[
+            {"address": "::1", "port": 443, "tx_bytes_limit": 1024}
+        ]"#;
+
+        let test_file = "/tmp/test_policy_ipv6.json";
+        let mut file = File::create(test_file).unwrap();
+        file.write_all(test_content.as_bytes()).unwrap();
+
+        manager.load_from_file(test_file).unwrap();
+
+        // IPv6 should match same IPv6
+        assert!(manager.is_allowed("::1", 443));
+        // Different IPv6 should not match
+        assert!(!manager.is_allowed("::2", 443));
 
         fs::remove_file(test_file).ok();
     }

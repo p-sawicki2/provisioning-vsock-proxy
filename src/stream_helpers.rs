@@ -1,8 +1,8 @@
 use log::{debug, info};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use vsock::VsockStream;
 
@@ -23,6 +23,7 @@ pub fn copy_bidirectional(
 {
     let mut tcp_buf = [0u8; BUFFER_SIZE];
     let bytes_rx = Arc::new(AtomicU64::new(0));
+    let bytes_tx = Arc::new(AtomicU64::new(0));
 
     let tcp_reader = tcp
         .try_clone()
@@ -74,6 +75,7 @@ pub fn copy_bidirectional(
 
     let policy_manager_clone = policy_manager.clone();
     let server_addr_clone = server_addr.clone();
+    let bytes_tx_clone = Arc::clone(&bytes_tx);
 
     let vsock_read_handle = thread::spawn(move || -> io::Result<()> {
         let mut vsock_read = vsock_reader;
@@ -86,7 +88,13 @@ pub fn copy_bidirectional(
                     Ok(0) => break,
                     Ok(n) => {
                         if let Some(manager) = &policy_manager_clone {
-                            manager.check_and_add_tx_bytes(&server_addr_clone, server_port, n as u64)?;
+                            manager.check_and_add_tx_bytes(
+                                &server_addr_clone,
+                                server_port,
+                                n as u64,
+                            )?;
+                        } else {
+                            bytes_tx_clone.fetch_add(n as u64, Ordering::SeqCst);
                         }
 
                         tcp_write.write_all(&vsock_buf[..n])?;
@@ -105,8 +113,16 @@ pub fn copy_bidirectional(
         // If we detect an error (due to tx byte limit check) we use shutdown(Shutdown::Both) to force
         // VSOCK <- TCP stream handling thread to close sockets. It shutdowns connections immediately
         // preventing from keeping half-open connections.
-        let vsock_read_shutdown = if result.is_err() { Shutdown::Both } else { Shutdown::Read };
-        let tcp_write_shutdown = if result.is_err() { Shutdown::Both } else { Shutdown::Write };
+        let vsock_read_shutdown = if result.is_err() {
+            Shutdown::Both
+        } else {
+            Shutdown::Read
+        };
+        let tcp_write_shutdown = if result.is_err() {
+            Shutdown::Both
+        } else {
+            Shutdown::Write
+        };
         if let Err(e) = vsock_read.shutdown(vsock_read_shutdown) {
             debug!("Vsock read shutdown (expected on peer close): {}", e);
         }
@@ -139,12 +155,14 @@ pub fn copy_bidirectional(
         Err(_) => debug!("VSOCK -> TCP thread panicked"),
     }
 
+    info!("Connection complete");
     // Log connection completion using PolicyManager's encapsulated method
     if let Some(manager) = &policy_manager {
-        manager.log_connection_complete(&server_addr, server_port, bytes_rx.load(Ordering::SeqCst));
+        manager.log_connection_complete(&server_addr, server_port);
     } else {
-        info!("Connection complete: RX: {} bytes", bytes_rx.load(Ordering::SeqCst));
+        info!("  TX: {} bytes", bytes_tx.load(Ordering::SeqCst));
     }
+    info!("  RX: {} bytes", bytes_rx.load(Ordering::SeqCst));
 
     Ok(())
 }
