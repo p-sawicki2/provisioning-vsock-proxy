@@ -139,20 +139,11 @@ pub fn copy_bidirectional(
         Err(_) => debug!("VSOCK -> TCP thread panicked"),
     }
 
-    if let Some(manager) = policy_manager {
-        if let Some(used) = manager.tx_bytes_used(&server_addr, server_port) {
-            if let Some(limit) = manager.tx_bytes_limit(&server_addr, server_port) {
-                info!(
-                    "Connection complete: Server {}:{} used {} / {} bytes (cumulative)",
-                    server_addr, server_port, used, limit
-                );
-            }
-        }
+    // Log connection completion using PolicyManager's encapsulated method
+    if let Some(manager) = &policy_manager {
+        manager.log_connection_complete(&server_addr, server_port, bytes_rx.load(Ordering::SeqCst));
     } else {
-        info!(
-            "Connection complete: RX: {} bytes",
-            bytes_rx.load(Ordering::SeqCst)
-        );
+        info!("Connection complete: RX: {} bytes", bytes_rx.load(Ordering::SeqCst));
     }
 
     Ok(())

@@ -1,13 +1,14 @@
-use log::debug;
+use log::{debug, info};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Rule defining access policy for a specific server
-#[derive(Debug)]
+/// This struct contains only configuration data from the JSON policy file
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerRule
 {
     /// Server address - can be a domain name or IPv4/IPv6 address
@@ -16,52 +17,48 @@ pub struct ServerRule
     pub port: u16,
     /// Maximum number of bytes that can be sent to this server
     pub tx_bytes_limit: u64,
-    /// Atomic counter tracking cumulative bytes sent to this server (not serialized)
-    pub tx_bytes_used: Arc<AtomicU64>,
-}
-
-/// Custom deserialization to initialize tx_bytes_used
-impl<'de> Deserialize<'de> for ServerRule {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct ServerRuleHelper {
-            pub address: String,
-            pub port: u16,
-            pub tx_bytes_limit: u64,
-        }
-
-        let helper = ServerRuleHelper::deserialize(deserializer)?;
-        Ok(ServerRule {
-            address: helper.address,
-            port: helper.port,
-            tx_bytes_limit: helper.tx_bytes_limit,
-            tx_bytes_used: Arc::new(AtomicU64::new(0)),
-        })
-    }
-}
-
-/// Clone implementation for ServerRule that shares the tx_bytes_used counter
-impl Clone for ServerRule {
-    fn clone(&self) -> Self {
-        ServerRule {
-            address: self.address.clone(),
-            port: self.port,
-            tx_bytes_limit: self.tx_bytes_limit,
-            tx_bytes_used: Arc::clone(&self.tx_bytes_used),
-        }
-    }
 }
 
 /// Whitelist of allowed servers
 pub type ServerWhitelist = Vec<ServerRule>;
 
-/// A policy manager maintaining the whitelist of servers
+/// Key for identifying a server in the stats map
+type ServerKey = (String, u16);
+
+/// Runtime statistics for servers, tracking cumulative TX bytes used
+pub struct ServerStatsHashMap
+{
+    stats: HashMap<ServerKey, Arc<AtomicU64>>,
+}
+
+impl ServerStatsHashMap {
+    pub fn new() -> Self {
+        ServerStatsHashMap {
+            stats: HashMap::new(),
+        }
+    }
+
+    /// Gets or creates a counter for the given server
+    pub fn get_or_create_counter(&mut self, address: &str, port: u16) -> Arc<AtomicU64> {
+        let key = (address.to_lowercase(), port);
+        self.stats
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
+    }
+}
+
+impl Default for ServerStatsHashMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A policy manager maintaining the whitelist of servers and runtime statistics
 pub struct PolicyManager
 {
     whitelist: RwLock<ServerWhitelist>,
+    stats: RwLock<ServerStatsHashMap>,
 }
 
 impl PolicyManager
@@ -70,6 +67,7 @@ impl PolicyManager
     {
         PolicyManager {
             whitelist: RwLock::new(ServerWhitelist::new()),
+            stats: RwLock::new(ServerStatsHashMap::new()),
         }
     }
 
@@ -116,6 +114,7 @@ impl PolicyManager
         false
     }
 
+    /// Gets the TX bytes limit for a specific server
     pub fn tx_bytes_limit(&self, address: &str, port: u16) -> Option<u64>
     {
         let guard = self.whitelist.read().expect("Failed to acquire read lock");
@@ -129,48 +128,62 @@ impl PolicyManager
         None
     }
 
-    pub fn tx_bytes_used(&self, address: &str, port: u16) -> Option<u64>
+    /// Gets the current TX bytes used for a specific server
+    /// Creates a counter if one doesn't exist yet
+    pub fn tx_bytes_used(&self, address: &str, port: u16) -> u64
     {
-        let guard = self.whitelist.read().expect("Failed to acquire read lock");
-
-        for rule in guard.iter() {
-            if rule.port == port && self.addresses_match(&rule.address, address) {
-                return Some(rule.tx_bytes_used.load(Ordering::SeqCst));
-            }
-        }
-
-        None
+        let mut stats_guard = self.stats.write().expect("Failed to acquire stats write lock");
+        let counter = stats_guard.get_or_create_counter(address, port);
+        counter.load(Ordering::SeqCst)
     }
 
+    /// Checks if adding the specified bytes would exceed the limit for the server,
+    /// and if not, atomically adds the bytes to the counter.
     pub fn check_and_add_tx_bytes(&self, address: &str, port: u16, bytes_to_add: u64) -> Result<(), std::io::Error>
     {
-        let guard = self.whitelist.read().expect("Failed to acquire read lock");
+        // First check if the server is in the whitelist and get its limit
+        let whitelist_guard = self.whitelist.read().expect("Failed to acquire read lock");
+        let tx_bytes_limit = whitelist_guard
+            .iter()
+            .find(|rule| rule.port == port && self.addresses_match(&rule.address, address))
+            .map(|rule| rule.tx_bytes_limit)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Server {}:{} not found in whitelist", address, port),
+                )
+            })?;
 
-        for rule in guard.iter() {
-            if rule.port == port && self.addresses_match(&rule.address, address) {
-                let current = rule.tx_bytes_used.load(Ordering::SeqCst);
+        drop(whitelist_guard);
 
-                // Check if adding bytes_to_add would exceed the limit
-                if current.saturating_add(bytes_to_add) > rule.tx_bytes_limit {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "TX bytes limit exceeded for {}:{}: {} + {} > {}",
-                            rule.address, rule.port, current, bytes_to_add, rule.tx_bytes_limit
-                        ),
-                    ));
+        // Get or create the counter in stats map
+        let mut stats_guard = self.stats.write().expect("Failed to acquire stats write lock");
+        let counter = stats_guard.get_or_create_counter(address, port);
+
+        // Check and add atomically using compare-exchange loop
+        loop {
+            let current = counter.load(Ordering::SeqCst);
+
+            // Check if adding bytes_to_add would exceed the limit
+            if current.saturating_add(bytes_to_add) > tx_bytes_limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "TX bytes limit exceeded for {}:{}: {} + {} > {}",
+                        address, port, current, bytes_to_add, tx_bytes_limit
+                    ),
+                ));
+            }
+
+            // Try to atomically add the bytes
+            match counter.compare_exchange(current, current + bytes_to_add, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Ok(()),
+                Err(_new_current) => {
+                    // Another thread modified the counter, retry with new value
+                    continue;
                 }
-
-                rule.tx_bytes_used.fetch_add(bytes_to_add, Ordering::SeqCst);
-
-                return Ok(());
             }
         }
-
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("Server {}:{} not found in whitelist", address, port),
-        ))
     }
 
 
@@ -202,13 +215,27 @@ impl PolicyManager
 
     pub fn log_policy(&self)
     {
-        let guard = self.whitelist.read().expect("Failed to acquire read lock");
-        debug!("Loaded policy with {} rules:", guard.len());
-        for rule in guard.iter() {
+        let whitelist_guard = self.whitelist.read().expect("Failed to acquire read lock");
+        debug!("Loaded policy with {} rules:", whitelist_guard.len());
+        for rule in whitelist_guard.iter() {
             debug!(
-                "  - address: {}, port: {}, tx_bytes_limit: {}, tx_bytes_used: {}",
-                rule.address, rule.port, rule.tx_bytes_limit, rule.tx_bytes_used.load(Ordering::SeqCst)
+                "  - address: {}, port: {}, tx_bytes_limit: {}",
+                rule.address, rule.port, rule.tx_bytes_limit
             );
+        }
+    }
+
+    /// Logs connection completion with cumulative TX bytes used for the server
+    pub fn log_connection_complete(&self, address: &str, port: u16, bytes_rx: u64)
+    {
+        let used = self.tx_bytes_used(address, port);
+        if let Some(limit) = self.tx_bytes_limit(address, port) {
+            info!(
+                "Connection complete: Server {}:{} used {} / {} bytes (cumulative)",
+                address, port, used, limit
+            );
+        } else {
+            info!("Connection complete: RX: {} bytes", bytes_rx);
         }
     }
 
@@ -334,8 +361,12 @@ mod tests
 
         manager.load_from_file(test_file).unwrap();
 
-        // Initially, tx_bytes_used should be 0
-        assert_eq!(manager.tx_bytes_used("example.com", 443), Some(0));
+        // Initially, tx_bytes_used returns 0 (counter created on first call)
+        assert_eq!(manager.tx_bytes_used("example.com", 443), 0);
+
+        // After first transmission, counter is updated
+        assert!(manager.check_and_add_tx_bytes("example.com", 443, 100).is_ok());
+        assert_eq!(manager.tx_bytes_used("example.com", 443), 100);
 
         fs::remove_file(test_file).ok();
     }
@@ -357,20 +388,20 @@ mod tests
 
         // First addition should succeed
         assert!(manager.check_and_add_tx_bytes("example.com", 443, 100).is_ok());
-        assert_eq!(manager.tx_bytes_used("example.com", 443), Some(100));
+        assert_eq!(manager.tx_bytes_used("example.com", 443), 100);
 
         // Second addition should succeed
         assert!(manager.check_and_add_tx_bytes("example.com", 443, 200).is_ok());
-        assert_eq!(manager.tx_bytes_used("example.com", 443), Some(300));
+        assert_eq!(manager.tx_bytes_used("example.com", 443), 300);
 
         // Third addition that would exceed limit should fail
         assert!(manager.check_and_add_tx_bytes("example.com", 443, 800).is_err());
         // Counter should remain unchanged after failed addition
-        assert_eq!(manager.tx_bytes_used("example.com", 443), Some(300));
+        assert_eq!(manager.tx_bytes_used("example.com", 443), 300);
 
         // Addition that brings exactly to limit should succeed
         assert!(manager.check_and_add_tx_bytes("example.com", 443, 700).is_ok());
-        assert_eq!(manager.tx_bytes_used("example.com", 443), Some(1000));
+        assert_eq!(manager.tx_bytes_used("example.com", 443), 1000);
 
         // Any further addition should fail
         assert!(manager.check_and_add_tx_bytes("example.com", 443, 1).is_err());
@@ -424,7 +455,7 @@ mod tests
         // Simulate multiple sessions adding bytes
         for i in 1..=10 {
             assert!(manager.check_and_add_tx_bytes("example.com", 443, 100).is_ok());
-            assert_eq!(manager.tx_bytes_used("example.com", 443), Some(i * 100));
+            assert_eq!(manager.tx_bytes_used("example.com", 443), i * 100);
         }
 
         fs::remove_file(test_file).ok();
@@ -446,26 +477,30 @@ mod tests
 
         manager.load_from_file(test_file).unwrap();
 
+        // Initially, counters return 0
+        assert_eq!(manager.tx_bytes_used("server1.com", 443), 0);
+        assert_eq!(manager.tx_bytes_used("server2.com", 443), 0);
+
         // Add bytes to server1
         assert!(manager.check_and_add_tx_bytes("server1.com", 443, 500).is_ok());
-        assert_eq!(manager.tx_bytes_used("server1.com", 443), Some(500));
-        assert_eq!(manager.tx_bytes_used("server2.com", 443), Some(0));
+        assert_eq!(manager.tx_bytes_used("server1.com", 443), 500);
+        assert_eq!(manager.tx_bytes_used("server2.com", 443), 0);
 
         // Add bytes to server2
         assert!(manager.check_and_add_tx_bytes("server2.com", 443, 1500).is_ok());
-        assert_eq!(manager.tx_bytes_used("server1.com", 443), Some(500));
-        assert_eq!(manager.tx_bytes_used("server2.com", 443), Some(1500));
+        assert_eq!(manager.tx_bytes_used("server1.com", 443), 500);
+        assert_eq!(manager.tx_bytes_used("server2.com", 443), 1500);
 
         // server1 should still have room for 500 more
         assert!(manager.check_and_add_tx_bytes("server1.com", 443, 500).is_ok());
-        assert_eq!(manager.tx_bytes_used("server1.com", 443), Some(1000));
+        assert_eq!(manager.tx_bytes_used("server1.com", 443), 1000);
 
         // server1 is now at limit
         assert!(manager.check_and_add_tx_bytes("server1.com", 443, 1).is_err());
 
         // server2 should still have room for 500 more
         assert!(manager.check_and_add_tx_bytes("server2.com", 443, 500).is_ok());
-        assert_eq!(manager.tx_bytes_used("server2.com", 443), Some(2000));
+        assert_eq!(manager.tx_bytes_used("server2.com", 443), 2000);
 
         fs::remove_file(test_file).ok();
     }
