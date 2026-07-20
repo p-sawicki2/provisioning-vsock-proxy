@@ -1,0 +1,6 @@
+[
+	{ "address": "127.0.0.1", "port": 1337, "tx_bytes_limit": 10 },
+	{ "address": "localhost", "port": 1337, "tx_bytes_limit": 500 },
+	{ "address": "::1", "port": 1337, "tx_bytes_limit": 500 }
+]
+

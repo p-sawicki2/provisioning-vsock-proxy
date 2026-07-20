@@ -148,11 +148,13 @@ fn main() -> io::Result<()>
                     peer_addr.port()
                 );
 
+                // This is intentional. We don't handle connection in a thread because
+                // we want handle them synchronously i.e. one connection at a time.
                 if let Err(e) = handle_vsock_connection(
                     vsock,
                     &args.server_addr,
                     args.timeout_secs,
-                    policy_manager.as_deref(),
+                    &policy_manager,
                 ) {
                     error!("Connection handler error: {}", e);
                 }
@@ -171,7 +173,7 @@ fn handle_vsock_connection(
     vsock: VsockStream,
     tcp_addr: &str,
     timeout_secs: u64,
-    policy_manager: Option<&policy::PolicyManager>,
+    policy_manager: &Option<Arc<policy::PolicyManager>>,
 ) -> io::Result<()>
 {
     let (host_for_policy, port_for_policy) = tcp_addr
@@ -194,7 +196,8 @@ fn handle_vsock_connection(
             )
         })?;
 
-    let tx_limit = if let Some(manager) = policy_manager {
+    // Check if connection is allowed by policy
+    if let Some(manager) = policy_manager {
         if !manager.is_allowed(host_for_policy, port_for_policy) {
             error!(
                 "Connection to {}:{} is not allowed by policy",
@@ -208,11 +211,7 @@ fn handle_vsock_connection(
                 ),
             ));
         }
-
-        manager.tx_bytes_limit(host_for_policy, port_for_policy)
-    } else {
-        None
-    };
+    }
 
     // Resolve the address and try to connect to each resolved address (fallback support)
     let (tcp, connected_addr) = tcp_addr
@@ -255,7 +254,16 @@ fn handle_vsock_connection(
         connected_addr, tcp_addr
     );
 
-    if let Err(e) = stream_helpers::copy_bidirectional(vsock, tcp, tx_limit) {
+    // Pass policy manager and server info to copy_bidirectional for per-server byte tracking
+    // Clone Arc and convert &str to String for thread-safe ownership
+    let policy_manager_clone = policy_manager.clone();
+    if let Err(e) = stream_helpers::copy_bidirectional(
+        vsock,
+        tcp,
+        policy_manager_clone,
+        host_for_policy.to_string(),
+        port_for_policy,
+    ) {
         error!("Copy bidirectional error: {}", e);
     }
 

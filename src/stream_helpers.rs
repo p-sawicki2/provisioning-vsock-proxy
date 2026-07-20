@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
@@ -6,35 +6,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use vsock::VsockStream;
 
+use crate::policy::PolicyManager;
 use crate::BUFFER_SIZE;
 
 const BUFFER_SIZE_VSOCK: usize = BUFFER_SIZE;
 
-/// Checks if the transmitted bytes exceed the limit
-fn check_tx_limit(current_tx: u64, limit: Option<u64>) -> io::Result<()>
-{
-    if let Some(max) = limit {
-        if current_tx > max {
-            warn!("TX bytes limit exceeded: {} > {}", current_tx, max);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("TX bytes limit exceeded: {} > {}", current_tx, max),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Copies data bidirectionally between vsock and TCP streams
-/// Optionally enforces a hard TX bytes limit on the VSOCK -> TCP direction
+/// Enforces a cumulative TX bytes limit per server (address:port) stored in PolicyManager
 pub fn copy_bidirectional(
     vsock: VsockStream,
     tcp: TcpStream,
-    tx_bytes_limit: Option<u64>,
+    policy_manager: Option<Arc<PolicyManager>>,
+    server_addr: String,
+    server_port: u16,
 ) -> io::Result<()>
 {
     let mut tcp_buf = [0u8; BUFFER_SIZE];
-    let bytes_tx = Arc::new(AtomicU64::new(0));
     let bytes_rx = Arc::new(AtomicU64::new(0));
 
     let tcp_reader = tcp
@@ -84,7 +71,9 @@ pub fn copy_bidirectional(
     let tcp_writer = tcp
         .try_clone()
         .map_err(|e| io::Error::new(e.kind(), "Failed to clone TCP writer stream"))?;
-    let bytes_tx_clone = Arc::clone(&bytes_tx);
+
+    let policy_manager_clone = policy_manager.clone();
+    let server_addr_clone = server_addr.clone();
 
     let vsock_read_handle = thread::spawn(move || -> io::Result<()> {
         let mut vsock_read = vsock_reader;
@@ -96,10 +85,9 @@ pub fn copy_bidirectional(
                 match vsock_read.read(&mut vsock_buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let current_tx =
-                            bytes_tx_clone.fetch_add(n as u64, Ordering::SeqCst) + n as u64;
-
-                        check_tx_limit(current_tx, tx_bytes_limit)?;
+                        if let Some(manager) = &policy_manager_clone {
+                            manager.check_and_add_tx_bytes(&server_addr_clone, server_port, n as u64)?;
+                        }
 
                         tcp_write.write_all(&vsock_buf[..n])?;
                         tcp_write.flush()?;
@@ -117,7 +105,7 @@ pub fn copy_bidirectional(
         // If we detect an error (due to tx byte limit check) we use shutdown(Shutdown::Both) to force
         // VSOCK <- TCP stream handling thread to close sockets. It shutdowns connections immediately
         // preventing from keeping half-open connections.
-        let vsock_read_shutdown = if result.is_err() { Shutdown:: Both } else { Shutdown::Read };
+        let vsock_read_shutdown = if result.is_err() { Shutdown::Both } else { Shutdown::Read };
         let tcp_write_shutdown = if result.is_err() { Shutdown::Both } else { Shutdown::Write };
         if let Err(e) = vsock_read.shutdown(vsock_read_shutdown) {
             debug!("Vsock read shutdown (expected on peer close): {}", e);
@@ -151,11 +139,21 @@ pub fn copy_bidirectional(
         Err(_) => debug!("VSOCK -> TCP thread panicked"),
     }
 
-    info!(
-        "Connection complete: TX: {} bytes, RX: {} bytes total",
-        bytes_tx.load(Ordering::SeqCst),
-        bytes_rx.load(Ordering::SeqCst)
-    );
+    if let Some(manager) = policy_manager {
+        if let Some(used) = manager.tx_bytes_used(&server_addr, server_port) {
+            if let Some(limit) = manager.tx_bytes_limit(&server_addr, server_port) {
+                info!(
+                    "Connection complete: Server {}:{} used {} / {} bytes (cumulative)",
+                    server_addr, server_port, used, limit
+                );
+            }
+        }
+    } else {
+        info!(
+            "Connection complete: RX: {} bytes",
+            bytes_rx.load(Ordering::SeqCst)
+        );
+    }
 
     Ok(())
 }
