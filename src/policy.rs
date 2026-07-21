@@ -81,6 +81,14 @@ pub struct PolicyManager
     stats: RwLock<ServerStatsHashMap>,
 }
 
+impl Default for PolicyManager
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
 impl PolicyManager
 {
     pub fn new() -> Self
@@ -199,13 +207,10 @@ impl PolicyManager
                 }
             })
             .map_err(|current| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "TX bytes limit exceeded for {}:{}: {} + {} > {}",
-                        address, port, current, bytes_to_add, tx_bytes_limit
-                    ),
-                )
+                std::io::Error::other(format!(
+                    "TX bytes limit exceeded for {}:{}: {} + {} > {}",
+                    address, port, current, bytes_to_add, tx_bytes_limit
+                ))
             })?;
 
         Ok(())
