@@ -1,14 +1,16 @@
+pub mod conproto;
 pub mod policy;
 pub mod stream_helpers;
 
 use clap::{Parser, ValueEnum};
 use log::{debug, error, info};
 use std::fmt;
-use std::io::{self};
+use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use vsock::{VsockListener, VsockStream, VMADDR_CID_HOST, VMADDR_CID_LOCAL};
+use conproto::{read_connect_request, send_connect_response};
 
 /// Vsock Context ID options for binding
 ///
@@ -82,6 +84,10 @@ struct Args
     #[arg(long, default_value = "127.0.0.1:1337")]
     server_addr: String,
 
+    /// Use connection protocol to select the server (ratls-get should also run with that option)
+    #[arg(short, long, default_value_t = false)]
+    conproto: bool,
+
     /// TCP connection timeout in seconds
     #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     timeout_secs: u64,
@@ -128,12 +134,16 @@ fn main() -> io::Result<()>
         args.vsock_port
     );
 
+    if args.conproto {
+        info!("Connection protocol is enabled.");
+    }
+
     let listener = VsockListener::bind_with_cid_port(args.vsock_cid.into(), args.vsock_port)
         .map_err(|e| io::Error::new(e.kind(), format!("Failed to bind vsock: {}", e)))?;
 
     for stream_result in listener.incoming() {
         match stream_result {
-            Ok(vsock) => {
+            Ok(mut vsock) => {
                 let peer_addr = match vsock.peer_addr() {
                     Ok(addr) => addr,
                     Err(e) => {
@@ -148,12 +158,25 @@ fn main() -> io::Result<()>
                     peer_addr.port()
                 );
 
+                let server_addr = if args.conproto {
+                    match read_connect_request(&mut vsock) {
+                        Ok(request) => request.server_addr,
+                        Err(e) => {
+                            error!("Failed to read connection request: {}", e);
+                            continue;
+                        }
+                    }
+                } else {
+                    args.server_addr.clone()
+                };
+
                 // This is intentional. We don't handle connection in a thread because
                 // we want handle them synchronously i.e. one connection at a time.
                 if let Err(e) = handle_vsock_connection(
                     vsock,
-                    &args.server_addr,
+                    &server_addr,
                     args.timeout_secs,
+                    args.conproto,
                     &policy_manager,
                 ) {
                     error!("Connection handler error: {}", e);
@@ -169,9 +192,10 @@ fn main() -> io::Result<()>
 }
 
 fn handle_vsock_connection(
-    vsock: VsockStream,
+    mut vsock: VsockStream,
     tcp_addr: &str,
     timeout_secs: u64,
+    conproto: bool,
     policy_manager: &Option<Arc<policy::PolicyManager>>,
 ) -> io::Result<()>
 {
@@ -252,6 +276,14 @@ fn handle_vsock_connection(
         "TCP connection established to {} (resolved from '{}'), starting proxy",
         connected_addr, tcp_addr
     );
+
+    if conproto {
+        send_connect_response(
+            &mut vsock,
+            true,
+            &format!("Connection established to {}", connected_addr),
+        )?;
+    }
 
     // Pass policy manager and server info to copy_bidirectional for per-server byte tracking
     // Clone Arc and convert &str to String for thread-safe ownership
