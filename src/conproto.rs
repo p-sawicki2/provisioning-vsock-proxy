@@ -57,7 +57,11 @@ pub fn read_connect_request<R: Read>(reader: &mut R) -> io::Result<ProxyRequest>
     Ok(request)
 }
 
-pub fn send_connect_response<W: Write>(writer: &mut W, success: bool, message: &str) -> io::Result<()>
+pub fn send_connect_response<W: Write>(
+    writer: &mut W,
+    success: bool,
+    message: &str,
+) -> io::Result<()>
 {
     let response = ProxyResponse {
         status: if success {

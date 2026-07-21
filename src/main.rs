@@ -3,6 +3,7 @@ pub mod policy;
 pub mod stream_helpers;
 
 use clap::{Parser, ValueEnum};
+use conproto::{read_connect_request, send_connect_response};
 use log::{debug, error, info};
 use std::fmt;
 use std::io;
@@ -10,7 +11,6 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use vsock::{VsockListener, VsockStream, VMADDR_CID_HOST, VMADDR_CID_LOCAL};
-use conproto::{read_connect_request, send_connect_response};
 
 /// Vsock Context ID options for binding
 ///
