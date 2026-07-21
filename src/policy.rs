@@ -182,8 +182,6 @@ impl PolicyManager
                 )
             })?;
 
-        drop(whitelist_guard);
-
         // Get or create the counter in stats map
         let mut stats_guard = self
             .stats
@@ -191,35 +189,26 @@ impl PolicyManager
             .expect("Failed to acquire stats write lock");
         let counter = stats_guard.get_or_create_counter(address, port);
 
-        // Check and add atomically using compare-exchange loop
-        loop {
-            let current = counter.load(Ordering::SeqCst);
-
-            // Check if adding bytes_to_add would exceed the limit
-            if current.saturating_add(bytes_to_add) > tx_bytes_limit {
-                return Err(std::io::Error::new(
+        // Check and add atomically using fetch_update (handles retry loop internally)
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                if current.saturating_add(bytes_to_add) > tx_bytes_limit {
+                    None // Signal to stop retrying
+                } else {
+                    Some(current + bytes_to_add) // New value to store
+                }
+            })
+            .map_err(|current| {
+                std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!(
                         "TX bytes limit exceeded for {}:{}: {} + {} > {}",
                         address, port, current, bytes_to_add, tx_bytes_limit
                     ),
-                ));
-            }
+                )
+            })?;
 
-            // Try to atomically add the bytes
-            match counter.compare_exchange(
-                current,
-                current + bytes_to_add,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(_new_current) => {
-                    // Another thread modified the counter, retry with new value
-                    continue;
-                }
-            }
-        }
+        Ok(())
     }
 
     /// Compares two addresses, handling both domain names and IP addresses
