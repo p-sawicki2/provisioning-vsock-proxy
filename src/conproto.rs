@@ -18,7 +18,7 @@ pub struct ProxyResponse
     pub reason: Option<String>,
 }
 
-pub fn read_connect_request<R: Read>(reader: &mut R) -> io::Result<ProxyRequest>
+pub fn receive_connection_request<R: Read>(reader: &mut R) -> io::Result<ProxyRequest>
 {
     let mut request_str = String::new();
     let mut buf = [0u8; 1024];
@@ -57,7 +57,7 @@ pub fn read_connect_request<R: Read>(reader: &mut R) -> io::Result<ProxyRequest>
     Ok(request)
 }
 
-pub fn send_connect_response<W: Write>(
+pub fn send_connection_response<W: Write>(
     writer: &mut W,
     success: bool,
     message: &str,

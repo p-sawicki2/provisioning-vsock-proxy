@@ -3,7 +3,7 @@ pub mod policy;
 pub mod stream_helpers;
 
 use clap::{Parser, ValueEnum};
-use conproto::{read_connect_request, send_connect_response};
+use conproto::{receive_connection_request, send_connection_response};
 use log::{debug, error, info};
 use std::fmt;
 use std::io;
@@ -159,7 +159,7 @@ fn main() -> io::Result<()>
                 );
 
                 let server_addr = if args.conproto {
-                    match read_connect_request(&mut vsock) {
+                    match receive_connection_request(&mut vsock) {
                         Ok(request) => request.server_addr,
                         Err(e) => {
                             error!("Failed to read connection request: {}", e);
@@ -278,7 +278,7 @@ fn handle_vsock_connection(
     );
 
     if conproto {
-        send_connect_response(
+        send_connection_response(
             &mut vsock,
             true,
             &format!("Connection established to {}", connected_addr),
